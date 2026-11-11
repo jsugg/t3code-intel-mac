@@ -5,13 +5,17 @@
 # `t3 wrapper` lists the commands it adds; everything else goes to the server CLI.
 set -euo pipefail
 
-T3_WRAPPER_VERSION="0.3.1"
+T3_WRAPPER_VERSION="0.4.0"
 T3_WRAPPER_REPO="jsugg/t3code-intel-mac"
 T3_UPSTREAM_URL="${T3_UPSTREAM_URL:-https://github.com/pingdotgg/t3code}"
 
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/t3code-intel-mac/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t3code-intel-mac"
-DEFAULT_REPO="${XDG_DATA_HOME:-$HOME/.local/share}/t3code-intel-mac/t3code"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/t3code-intel-mac"
+DEFAULT_REPO="$DATA_DIR/t3code"
+RELEASES_DIR="$DATA_DIR/releases"
+CURRENT_LINK="$DATA_DIR/current"
+KEEP_RELEASES=2
 
 DEFAULT_LABEL="io.github.jsugg.t3code-intel-mac"
 LABEL="${T3_SERVICE_LABEL:-$DEFAULT_LABEL}"
@@ -84,10 +88,11 @@ canonical_dir() {
 
 # --- Node and vp ---------------------------------------------------------------
 
+# node_version [ROOT]: engines.node from ROOT/package.json (default: the checkout).
 node_version() {
-  local v
-  v="$(sed -n 's/^ *"node": *"\([0-9][0-9.]*\)".*/\1/p' "$T3_REPO/package.json" | head -1)"
-  [ -n "$v" ] || die "could not read engines.node from $T3_REPO/package.json"
+  local root="${1:-$T3_REPO}" v
+  v="$(sed -n 's/^ *"node": *"\([0-9][0-9.]*\)".*/\1/p' "$root/package.json" | head -1)"
+  [ -n "$v" ] || die "could not read engines.node from $root/package.json"
   echo "$v"
 }
 
@@ -103,11 +108,11 @@ load_vp() {
   die "vp not found; install it with: curl -fsSL https://vite.plus | VP_NODE_MANAGER=no bash"
 }
 
-# Sets NODE to an absolute path for the repo's pinned Node; vp downloads it on first use.
+# resolve_node [ROOT]: sets NODE to the Node that ROOT pins; vp downloads it on first use.
 resolve_node() {
   if [ -n "${T3_NODE:-}" ]; then NODE="$T3_NODE"; return; fi
   local v cache
-  v="$(node_version)"
+  v="$(node_version "${1:-}")"
   cache="$STATE_DIR/node-$v"
   if [ -f "$cache" ]; then
     NODE="$(cat "$cache")"
@@ -132,6 +137,104 @@ build() {
   (cd "$T3_REPO" && PATH="$path" vp i && PATH="$path" vp run build:desktop)
 }
 
+# --- Releases ------------------------------------------------------------------
+# The server bundle loads hashed chunks on demand and a build wipes dist/, so a
+# server must never run from the checkout being rebuilt. Each good build is
+# snapshotted into releases/<time>-<commit> and the server runs from `current`.
+# Servers are launched with the resolved path, so flipping `current` never
+# changes files under a running one.
+
+# Resolved path of the current release, or nothing before the first snapshot.
+current_release() {
+  if [ -L "$CURRENT_LINK" ] && [ -f "$CURRENT_LINK/apps/server/dist/bin.mjs" ]; then
+    (cd "$CURRENT_LINK" && pwd -P)
+  fi
+  return 0
+}
+
+# What to run: the current release, else a checkout built before releases existed.
+server_root() {
+  local rel
+  rel="$(current_release)"
+  echo "${rel:-$T3_REPO}"
+}
+
+# clonefile(2) clones a whole tree copy-on-write in one call on APFS: ~25s and
+# almost no disk for a 4 GB build, where `cp -c` takes minutes file by file.
+CLONEFILE_PY='
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) != 0:
+    sys.exit(os.strerror(ctypes.get_errno()))
+'
+
+clone_path() {
+  # /usr/bin/python3 is a stub that prompts for the developer tools when they're missing.
+  if [ "$(uname -s)" = Darwin ] && xcode-select -p >/dev/null 2>&1 &&
+    /usr/bin/python3 -I -c "$CLONEFILE_PY" "$1" "$2" 2>/dev/null; then
+    return 0
+  fi
+  rm -rf "$2"
+  cp -cR "$1" "$2" 2>/dev/null && return 0
+  rm -rf "$2"
+  cp -R "$1" "$2"
+}
+
+make_release() {
+  local sha id tmp entry
+  sha="$(git_repo rev-parse HEAD)"
+  id="$(date +%Y%m%d%H%M%S)-${sha:0:12}"
+  while [ -e "$RELEASES_DIR/$id" ]; do id="$id-1"; done
+  tmp="$RELEASES_DIR/.incoming-$id"
+  mkdir -p "$tmp"
+  say "snapshotting the build"
+  for entry in "$T3_REPO"/* "$T3_REPO"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    [ "$(basename "$entry")" = .git ] && continue
+    if ! clone_path "$entry" "$tmp/$(basename "$entry")"; then
+      rm -rf "$tmp"
+      die "could not snapshot the build into $RELEASES_DIR"
+    fi
+  done
+  mv "$tmp" "$RELEASES_DIR/$id"
+  ln -sfn "releases/$id" "$CURRENT_LINK"
+  git_repo config t3.built "$sha"
+  prune_releases
+}
+
+# A character class has no ${var//} equivalent; pgrep patterns are extended regexes.
+# shellcheck disable=SC2001
+regex_escape() { sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$1"; }
+count_procs() { pgrep -f -- "$1" 2>/dev/null | grep -c . || true; }
+release_in_use() { [ "$(count_procs "$(regex_escape "$1")/")" -gt 0 ]; }
+
+# Keeps the newest KEEP_RELEASES and any release a running server still uses.
+prune_releases() {
+  local cur kept=0 dir
+  cur="$(current_release)"
+  [ -d "$RELEASES_DIR" ] || return 0
+  while IFS= read -r dir; do
+    if [ "$dir" = "$cur" ] || [ "$kept" -lt "$KEEP_RELEASES" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if release_in_use "$dir"; then continue; fi
+    rm -rf "$dir"
+  done < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort -r)
+  # Leftovers from an interrupted snapshot.
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -name '.incoming-*' -exec rm -rf {} +
+}
+
+# Count of server processes running something other than the current release.
+stale_servers() {
+  local cur entry all current=0
+  cur="$(current_release)"
+  entry="apps/server/dist/bin\.mjs"
+  all="$(count_procs "($(regex_escape "$RELEASES_DIR")/[^/]+|$(regex_escape "$T3_REPO"))/$entry")"
+  [ -z "$cur" ] || current="$(count_procs "$(regex_escape "$cur")/$entry")"
+  echo $((all - current))
+}
+
 # --- Channels and updates ------------------------------------------------------
 
 describe() { git_repo describe --tags --exclude 'mobile-*' --always; }
@@ -144,6 +247,8 @@ built_commit() {
   [ -f "$SERVER_BIN" ] && git_repo rev-parse HEAD
   return 0
 }
+
+has_build() { [ -n "$(current_release)" ] || [ -f "$SERVER_BIN" ]; }
 
 # Releases are tags: vX.Y.Z (stable) and vX.Y.Z-nightly.YYYYMMDD.N (nightly).
 # main is the untagged tip, newer than either and never released.
@@ -211,9 +316,11 @@ cmd_update() {
   target_sha="$(git_repo rev-parse "$target^{commit}")"
   built="$(built_commit)"
 
-  if [ "$target_sha" = "$built" ] && [ -f "$SERVER_BIN" ]; then
+  if [ "$target_sha" = "$built" ] && has_build; then
     [ -n "$pin" ] || git_repo config t3.channel "$ch"
-    say "already on $ch @ $(describe)"
+    # Builds made before releases existed get their first snapshot here.
+    if [ -z "$(current_release)" ] && [ "$(git_repo rev-parse HEAD)" = "$built" ]; then make_release; fi
+    say "already on ${pin:-$ch} @ $(describe)"
     return
   fi
   # Older releases can't read a database a newer one migrated.
@@ -227,10 +334,15 @@ cmd_update() {
   if ! build; then
     say "build failed; restoring $prev_ref"
     restore "$prev_ref" "$prev_sha"
+    if [ -n "$(current_release)" ]; then
+      die "update aborted; the server keeps running its current build ($(describe))"
+    fi
+    # No snapshot to fall back on: the failed build wiped the only one, so rebuild it.
     build || die "restore build failed too; run 't3 rebuild' after fixing the error above"
+    make_release
     die "update aborted; still on $(describe)"
   fi
-  git_repo config t3.built "$target_sha"
+  make_release
   [ -n "$pin" ] || git_repo config t3.channel "$ch"
   say "now on ${pin:+pinned }${pin:-$ch} @ $(describe)"
   after_build
@@ -238,8 +350,8 @@ cmd_update() {
 
 cmd_rebuild() {
   require_repo
-  build
-  git_repo config t3.built "$(git_repo rev-parse HEAD)"
+  build || die "build failed; the server keeps running its current build"
+  make_release
   after_build
 }
 
@@ -252,7 +364,7 @@ after_build() {
       say "service still runs the old build; run 't3 service restart' when ready"
     fi
   fi
-  if pgrep -f "$SERVER_BIN" >/dev/null 2>&1 && ! service_loaded; then
+  if ! service_loaded && [ "$(stale_servers)" -gt 0 ]; then
     say "a server started by hand is still running the old build; restart it to pick up the new one"
   fi
   return 0
@@ -358,7 +470,7 @@ cmd_service() {
   case "${1:-status}" in
     install)
       require_repo
-      [ -f "$SERVER_BIN" ] || die "server not built; run 't3 rebuild' first"
+      has_build || die "server not built; run 't3 rebuild' first"
       service_unload
       write_plist
       launchctl bootstrap "gui/$(uid)" "$PLIST"
@@ -426,13 +538,15 @@ cmd_uninstall() {
   [ -f "$CONFIG_FILE" ] && echo "  wrapper config      $(dirname "$CONFIG_FILE")"
   if [ "$T3_REPO" = "$DEFAULT_REPO" ] && [ -d "$T3_REPO" ]; then
     remove_repo=1
-    echo "  source checkout     $(dirname "$T3_REPO")"
+    echo "  source and builds   $DATA_DIR"
+  elif [ -d "$RELEASES_DIR" ]; then
+    echo "  build snapshots     $RELEASES_DIR"
   fi
   echo "Kept: ~/.t3 (projects, threads, settings), vp, and Node."
   confirm "continue?" || die "nothing removed"
   if [ "$(uname -s)" = Darwin ]; then cmd_service uninstall; fi
-  rm -rf "$STATE_DIR" "$(dirname "$CONFIG_FILE")"
-  [ "$remove_repo" = 1 ] && rm -rf "$(dirname "$T3_REPO")"
+  rm -rf "$STATE_DIR" "$(dirname "$CONFIG_FILE")" "$RELEASES_DIR" "$CURRENT_LINK"
+  [ "$remove_repo" = 1 ] && rm -rf "$DATA_DIR"
   rm -f "$self"
   say "uninstalled"
 }
@@ -460,15 +574,19 @@ Everything else runs the T3 Code server CLI: t3, t3 serve, t3 pair, t3 --help.
 EOF
 }
 
+# Sets RUN_BIN to the server entry of the build to run, and NODE to the Node it pins.
 prepare_server() {
+  local root
   require_repo
-  [ -f "$SERVER_BIN" ] || die "server not built; run 't3 rebuild'"
-  resolve_node
+  root="$(server_root)"
+  RUN_BIN="$root/apps/server/dist/bin.mjs"
+  [ -f "$RUN_BIN" ] || die "server not built; run 't3 rebuild'"
+  resolve_node "$root"
 }
 
 run_server() {
   prepare_server
-  exec "$NODE" "$SERVER_BIN" "$@"
+  exec "$NODE" "$RUN_BIN" "$@"
 }
 
 file_sum() { [ -f "$1" ] && cksum <"$1" || echo none; }
@@ -493,9 +611,9 @@ cmd_access() {
   log="$(mktemp "${TMPDIR:-/tmp}/t3-up.XXXXXX")"
   if interactive && [ "$(uname -s)" = Darwin ]; then
     # script(1) keeps prompts and sign-in interactive while recording the output.
-    script -q "$log" "$NODE" "$SERVER_BIN" "$@" || status=$?
+    script -q "$log" "$NODE" "$RUN_BIN" "$@" || status=$?
   else
-    "$NODE" "$SERVER_BIN" "$@" 2>&1 | tee "$log" || status=$?
+    "$NODE" "$RUN_BIN" "$@" 2>&1 | tee "$log" || status=$?
   fi
   if [ "$status" -ne 0 ] && grep -q 'release archive for darwin-x64' "$log"; then
     status=0
@@ -532,7 +650,7 @@ cmd_access() {
 cmd_status() {
   local status=0 arg
   prepare_server
-  "$NODE" "$SERVER_BIN" status "$@" || status=$?
+  "$NODE" "$RUN_BIN" status "$@" || status=$?
   for arg in "$@"; do [ "$arg" = --json ] && return "$status"; done
   if [ "$(uname -s)" = Darwin ]; then
     echo

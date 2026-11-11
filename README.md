@@ -21,6 +21,7 @@ Silicon or Linux, use the official `curl -fsSL https://t3.codes/install.sh | sh`
 - An Intel Mac. `uname -m` prints `x86_64`.
 - `git`, from the Xcode Command Line Tools, and `curl`, which ships with macOS.
 - About 5 GB for the checkout and its dependencies, plus about 650 MB for vp and Node.
+  Build snapshots are copy-on-write clones on APFS, so they add little on top.
 - A provider CLI on your `PATH`, as described in upstream's
   [providers section](https://github.com/pingdotgg/t3code/blob/main/docs/user/install.md#providers).
 
@@ -97,8 +98,11 @@ An older release can't read a database that a newer one already migrated.
 `t3 update` refuses to go backwards (nightly to stable, for example) unless you
 add `--allow-downgrade`.
 
-If a build fails, the wrapper checks out the previous release again and
-rebuilds it, so you keep a working server.
+Each successful build is snapshotted, and the server always runs from the
+snapshot, never from the checkout. A build can wipe and rewrite the checkout
+while a server runs, and the files that server loaded stay the same. If a
+build fails, the wrapper checks out the previous commit again and the server
+keeps its current snapshot, with no rebuild.
 
 After a successful update, the wrapper asks before restarting the background
 service, because a restart stops running agent turns and terminals. Pass
@@ -161,8 +165,8 @@ t3 uninstall
 
 It lists what it will remove and asks once. `--yes` skips the question, and
 without a terminal it's required. It removes
-the background service, the wrapper, its state and config, and the checkout if
-the installer cloned it to the default path. A checkout you pointed it at with
+the background service, the wrapper, its state and config, the build snapshots,
+and the checkout if the installer cloned it to the default path. A checkout you pointed it at with
 `T3_REPO` stays. So do `~/.t3` (projects, threads, and settings), vp, and Node.
 Remove vp with `rm -rf ~/.local/share/vite-plus ~/.config/vite-plus`.
 
@@ -171,9 +175,9 @@ Remove vp with `rm -rf ~/.local/share/vite-plus ~/.config/vite-plus`.
 **`vp not found`.** The wrapper looks in `~/.config/vite-plus/env`. Reinstall vp
 with `curl -fsSL https://vite.plus | VP_NODE_MANAGER=no bash`.
 
-**A build fails.** The wrapper restores the previous build, so `t3` still runs.
-Build errors usually come from upstream. Run `t3 rebuild` to see the full output,
-or wait for the next release and `t3 update` again.
+**A build fails.** The server keeps running its current snapshot, so `t3` still
+works. Build errors usually come from upstream. Run `t3 rebuild` to see the full
+output, or wait for the next release and `t3 update` again.
 
 **`local changes in ...`.** Something other than `pnpm-lock.yaml` changed in the
 checkout. Check with `git -C "$(t3 repo)" status` and stash or discard it.
@@ -194,7 +198,15 @@ agent after a crash and waits at least 10 seconds between attempts.
 - `bin/t3` reads the Node version from `engines.node` in T3 Code's `package.json`
   and asks vp for that exact version. vp downloads it once into its own store. The
   path is cached in `~/.local/state/t3code-intel-mac`.
-- Builds run `vp i && vp run build:desktop`, as upstream documents.
+- Builds run `vp i && vp run build:desktop` in the checkout, as upstream documents.
+- A successful build is cloned, without `.git`, into
+  `~/.local/share/t3code-intel-mac/releases/<time>-<commit>`, and the `current`
+  symlink next to it moves to the new snapshot. On APFS one `clonefile(2)` call
+  does this in about 25 seconds with almost no extra disk. Elsewhere it falls back
+  to a plain copy.
+- Servers start from the resolved snapshot path, so moving `current` never
+  touches a running server. The wrapper keeps the two newest snapshots plus any a
+  running server still uses, and deletes the rest.
 - Wrapper state lives in the checkout's git config: `t3.channel`, and
   `t3.built` for the last successful build.
 - The launchd agent runs `bin/t3 __service-run`, which loads `service.env` and
