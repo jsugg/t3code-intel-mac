@@ -206,6 +206,10 @@ head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*
 }
 
 @test "old snapshots are pruned unless a server still runs them" {
+  # Same timestamp for every snapshot, as on a fast machine: order must still hold.
+  stub date <<'EOF2'
+echo 20260101000000
+EOF2
   "$T3" update 0.1.0 --yes
   oldest="$(current)"
   # A process whose command line names the oldest snapshot, like a server would.
@@ -447,4 +451,18 @@ EOF2
   [ "$status" -ne 0 ]
   cmp -s "$T3" "$BATS_TEST_TMPDIR/bin/t3"
   [ "$(ls "$BATS_TEST_TMPDIR/bin")" = t3 ]
+}
+
+@test "snapshots named before sequence numbers count as the oldest" {
+  "$T3" update 0.1.0 --yes
+  legacy="$XDG_DATA_HOME/t3code-intel-mac/releases/20261111153201-d2c25950b4d9"
+  mv "$(current)" "$legacy"
+  ln -sfn "releases/$(basename "$legacy")" "$XDG_DATA_HOME/t3code-intel-mac/current"
+  "$T3" update 0.1.1 --yes
+  [[ "$(basename "$(current)")" == 000001-* ]]
+  "$T3" update 0.1.2-nightly.20261111.9 --yes
+  [[ "$(basename "$(current)")" == 000002-* ]]
+  run releases
+  [[ "$output" != *"$legacy"* ]]
+  [ "$(wc -l <<<"$output")" -eq 2 ]
 }

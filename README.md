@@ -200,7 +200,7 @@ agent after a crash and waits at least 10 seconds between attempts.
   path is cached in `~/.local/state/t3code-intel-mac`.
 - Builds run `vp i && vp run build:desktop` in the checkout, as upstream documents.
 - A successful build is cloned, without `.git`, into
-  `~/.local/share/t3code-intel-mac/releases/<time>-<commit>`, and the `current`
+  `~/.local/share/t3code-intel-mac/releases/<seq>-<time>-<commit>`, and the `current`
   symlink next to it moves to the new snapshot. On APFS one `clonefile(2)` call
   does this in about 25 seconds with almost no extra disk. Elsewhere it falls back
   to a plain copy.
