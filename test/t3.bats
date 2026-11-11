@@ -16,9 +16,12 @@ setup() {
 case "$1" in
   i) echo "rewritten" >>pnpm-lock.yaml ;;
   run)
+    # Like the real build: dist/ is wiped first, so a failure leaves nothing.
+    rm -rf apps/server/dist
     [ -f FAIL_BUILD ] && { echo "stub build failure" >&2; exit 1; }
     mkdir -p apps/server/dist
     echo "// built" >apps/server/dist/bin.mjs
+    git rev-parse HEAD >apps/server/dist/commit
     ;;
   *) echo "unexpected vp $*" >&2; exit 2 ;;
 esac
@@ -100,6 +103,9 @@ make_upstream() {
   )
 }
 
+current() { (cd "$XDG_DATA_HOME/t3code-intel-mac/current" && pwd -P); }
+releases() { find "$XDG_DATA_HOME/t3code-intel-mac/releases" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort; }
+
 head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*' 2>/dev/null || git -C "$T3_REPO" rev-parse --short HEAD; }
 
 @test "stable picks the highest plain vX.Y.Z tag" {
@@ -165,14 +171,68 @@ head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*
   [[ "$output" == *"unknown channel 'beta'"* ]]
 }
 
-@test "a failed build restores the previous release and its build" {
+@test "a failed build keeps the running release and skips a rebuild" {
   "$T3" update --channel stable --yes
+  before="$(current)"
   run "$T3" update 0.1.3-preview.20261112.1 --yes
   [ "$status" -ne 0 ]
-  [[ "$output" == *"restoring"* ]]
+  [[ "$output" == *"keeps running its current build"* ]]
+  [ "$(grep -c 'building' <<<"$output")" -eq 1 ]
   [ "$(head_tag)" = v0.1.1 ]
-  [ -f "$T3_REPO/apps/server/dist/bin.mjs" ]
+  [ "$(current)" = "$before" ]
+  [ "$(cat "$before/apps/server/dist/commit")" = "$(git -C "$T3_REPO" rev-parse v0.1.1)" ]
   [ "$(git -C "$T3_REPO" config t3.built)" = "$(git -C "$T3_REPO" rev-parse v0.1.1)" ]
+}
+
+@test "without a snapshot, a failed build rebuilds the previous commit" {
+  "$T3" update --channel stable --yes
+  rm -rf "$XDG_DATA_HOME/t3code-intel-mac"
+  run "$T3" update 0.1.3-preview.20261112.1 --yes
+  [ "$status" -ne 0 ]
+  [ "$(grep -c 'building' <<<"$output")" -eq 2 ]
+  [ "$(cat "$(current)/apps/server/dist/commit")" = "$(git -C "$T3_REPO" rev-parse v0.1.1)" ]
+}
+
+@test "each update runs from its own snapshot, away from the checkout" {
+  "$T3" update --channel stable --yes
+  first="$(current)"
+  [[ "$first" == "$XDG_DATA_HOME"/t3code-intel-mac/releases/* ]]
+  [ ! -e "$first/.git" ]
+  "$T3" update --channel nightly --yes
+  [ "$(current)" != "$first" ]
+  # The old snapshot is intact for a server still running it.
+  [ "$(cat "$first/apps/server/dist/commit")" = "$(git -C "$T3_REPO" rev-parse v0.1.1)" ]
+  [ "$(cat "$(current)/apps/server/dist/commit")" = "$(git -C "$T3_REPO" rev-parse HEAD)" ]
+}
+
+@test "old snapshots are pruned unless a server still runs them" {
+  "$T3" update 0.1.0 --yes
+  oldest="$(current)"
+  # A process whose command line names the oldest snapshot, like a server would.
+  (exec -a "node $oldest/apps/server/dist/bin.mjs" sleep 30) &
+  holder=$!
+  "$T3" update 0.1.1-nightly.20261109.9 --yes
+  middle="$(current)"
+  "$T3" update 0.1.1 --yes
+  "$T3" update 0.1.2-nightly.20261111.9 --yes
+  kill "$holder"
+  run releases
+  [[ "$output" == *"$oldest"* ]]
+  [[ "$output" != *"$middle"* ]]
+  [ "$(wc -l <<<"$output")" -eq 3 ]
+}
+
+@test "a build from before snapshots existed gets one on the next update" {
+  "$T3" update --channel stable --yes
+  rm -rf "$XDG_DATA_HOME/t3code-intel-mac"
+  git -C "$T3_REPO" config --unset t3.built
+  run "$T3" serve
+  [ "$output" = "node $T3_REPO/apps/server/dist/bin.mjs serve" ]
+  run "$T3" update --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already on stable"* ]]
+  [[ "$output" == *"snapshotting"* ]]
+  [ -f "$(current)/apps/server/dist/bin.mjs" ]
 }
 
 @test "a failed build on main moves the branch back" {
@@ -203,7 +263,7 @@ head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*
   "$T3" update --channel stable --yes
   run "$T3" serve --no-browser --port 1234
   [ "$status" -eq 0 ]
-  [ "$output" = "node $T3_REPO/apps/server/dist/bin.mjs serve --no-browser --port 1234" ]
+  [ "$output" = "node $(current)/apps/server/dist/bin.mjs serve --no-browser --port 1234" ]
 }
 
 @test "running before a build says how to fix it" {
