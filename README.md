@@ -1,5 +1,7 @@
 # t3code-intel-mac
 
+[![CI](https://github.com/jsugg/t3code-intel-mac/actions/workflows/ci.yml/badge.svg)](https://github.com/jsugg/t3code-intel-mac/actions/workflows/ci.yml)
+
 A `t3` command for [T3 Code](https://github.com/pingdotgg/t3code) on Intel Macs.
 
 T3 Code doesn't ship a `t3` CLI for Intel Macs, and the reason is technical: the
@@ -14,11 +16,22 @@ builds it on the Node version upstream pins, and passes every other command
 through to the real server CLI. It isn't affiliated with T3 Code. On Apple
 Silicon or Linux, use the official `curl -fsSL https://t3.codes/install.sh | sh`.
 
+## Requirements
+
+- An Intel Mac. `uname -m` prints `x86_64`.
+- `git` and `curl`. Both come with the Xcode Command Line Tools.
+- About 5 GB for the checkout and its dependencies, plus about 650 MB for vp and Node.
+- A provider CLI on your `PATH`, as described in upstream's
+  [providers section](https://github.com/pingdotgg/t3code/blob/main/docs/user/install.md#providers).
+
 ## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jsugg/t3code-intel-mac/main/install.sh | bash
 ```
+
+It's a short script. Read [`install.sh`](install.sh) first if you'd rather not
+pipe a URL into bash, or clone this repo and run `./install.sh`.
 
 The installer:
 
@@ -33,11 +46,23 @@ The installer:
 | `T3_REPO`    | `~/.local/share/t3code-intel-mac/t3code`  | Use an existing checkout or another path |
 | `T3_CHANNEL` | `stable`                                  | `stable`, `nightly`, or `main`         |
 | `T3_BIN_DIR` | `~/.local/bin`                            | Where `t3` goes                        |
+| `T3_INTEL_FORCE` | unset                                 | Set to `1` to install on a machine that isn't an Intel Mac |
 
 A non-default `T3_REPO` is saved to `~/.config/t3code-intel-mac/config`.
 
-You still need a provider CLI on your `PATH`, as described in upstream's
-[providers section](https://github.com/pingdotgg/t3code/blob/main/docs/user/install.md#providers).
+### Using a checkout you already built
+
+If you followed upstream's Intel instructions, point the installer at that
+checkout instead of cloning again. Pick the channel your build is on. A source
+build of `main` is newer than any release, so `stable` or `nightly` would count
+as a downgrade:
+
+```bash
+T3_REPO=~/path/to/t3code T3_CHANNEL=main ./install.sh
+```
+
+The checkout needs a clean working tree. The installer leaves your branch alone
+apart from the update it runs.
 
 ## Use
 
@@ -74,6 +99,11 @@ add `--allow-downgrade`.
 If a build fails, the wrapper checks out the previous release again and
 rebuilds it, so you keep a working server.
 
+After a successful update, the wrapper asks before restarting the background
+service, because a restart stops running agent turns and terminals. Pass
+`--yes` to skip the question. A server you started by hand keeps running the
+old build until you restart it.
+
 ### Background service
 
 `t3 service install` writes `~/Library/LaunchAgents/io.github.jsugg.t3code-intel-mac.plist`.
@@ -103,11 +133,40 @@ failure keeps its exit code.
 `t3 status` prints upstream's status, which always says "Service not installed"
 on Intel, followed by the state of this wrapper's service.
 
-### Updates and the service
+## Uninstall
 
-After `t3 update`, the wrapper asks before restarting the service, because a
-restart stops running agent turns and terminals. Pass `--yes` to skip the
-question.
+```bash
+t3 uninstall
+```
+
+It lists what it will remove and asks once (`--yes` skips the question):
+the background service, the wrapper, its state and config, and the checkout if
+the installer cloned it to the default path. A checkout you pointed it at with
+`T3_REPO` stays. So do `~/.t3` (projects, threads, and settings), vp, and Node.
+Remove vp with `rm -rf ~/.local/share/vite-plus ~/.config/vite-plus`.
+
+## Troubleshooting
+
+**`vp not found`.** The wrapper looks in `~/.config/vite-plus/env`. Reinstall vp
+with `curl -fsSL https://vite.plus | VP_NODE_MANAGER=no bash`.
+
+**A build fails.** The wrapper restores the previous build, so `t3` still runs.
+Build errors usually come from upstream. Run `t3 rebuild` to see the full output,
+or wait for the next release and `t3 update` again.
+
+**`local changes in ...`.** Something other than `pnpm-lock.yaml` changed in the
+checkout. Check with `git -C "$(t3 repo)" status` and stash or discard it.
+
+**Port 3773 is in use.** Another T3 Code server is running, maybe the desktop app
+or a `t3 serve` in a terminal. Stop it, or set `T3CODE_PORT` in `~/.t3/service.env`
+and run `t3 service restart`.
+
+**The service can't find a provider CLI.** launchd doesn't load your shell
+profile, so the agent uses the `PATH` saved at install time. Run
+`t3 service install` again from a shell where the provider works.
+
+**The service keeps restarting.** Read `t3 service logs`. launchd restarts the
+agent after a crash and waits at least 10 seconds between attempts.
 
 ## How it works
 
