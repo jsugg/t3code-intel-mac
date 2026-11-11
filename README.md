@@ -11,7 +11,7 @@ Upstream's [Intel instructions](https://github.com/pingdotgg/t3code/blob/main/do
 tell you to build from source and run `node apps/server/dist/bin.mjs` yourself.
 That works, but then `t3 update` and `t3 service` don't.
 
-This repo is one bash script that fills that gap. It keeps a source checkout,
+This repo is one bash script, plus an installer, that fills that gap. It keeps a source checkout,
 builds it on the Node version upstream pins, and passes every other command
 through to the real server CLI. It isn't affiliated with T3 Code. On Apple
 Silicon or Linux, use the official `curl -fsSL https://t3.codes/install.sh | sh`.
@@ -19,7 +19,7 @@ Silicon or Linux, use the official `curl -fsSL https://t3.codes/install.sh | sh`
 ## Requirements
 
 - An Intel Mac. `uname -m` prints `x86_64`.
-- `git` and `curl`. Both come with the Xcode Command Line Tools.
+- `git`, from the Xcode Command Line Tools, and `curl`, which ships with macOS.
 - About 5 GB for the checkout and its dependencies, plus about 650 MB for vp and Node.
 - A provider CLI on your `PATH`, as described in upstream's
   [providers section](https://github.com/pingdotgg/t3code/blob/main/docs/user/install.md#providers).
@@ -83,6 +83,7 @@ t3 wrapper              # list the commands this wrapper adds
 | `t3 service install` | Run the server as a launchd agent that starts at login |
 | `t3 service status` / `restart` / `logs [-f]` / `uninstall` | Manage that agent |
 | `t3 up`, `t3 connect` | Upstream remote access setup; installs or restarts this wrapper's service |
+| `t3 status` | Upstream's status, plus the state of this wrapper's service |
 | `t3 self-update` | Replace the wrapper with the latest version from this repo |
 | `t3 uninstall` | Remove the wrapper, its service, and a default checkout |
 
@@ -101,8 +102,9 @@ rebuilds it, so you keep a working server.
 
 After a successful update, the wrapper asks before restarting the background
 service, because a restart stops running agent turns and terminals. Pass
-`--yes` to skip the question. A server you started by hand keeps running the
-old build until you restart it.
+`--yes` to skip the question. Without a terminal it leaves the service on the
+old build unless you pass `--yes`. A server you started by hand keeps running
+the old build until you restart it.
 
 ### Background service
 
@@ -113,7 +115,8 @@ so the server can find provider CLIs, so run `t3 service install` again after
 you install a new one. It serves `~/.t3`; run `T3CODE_HOME=/other/home t3 service install`
 to serve another T3 home.
 
-It reads `~/.t3/service.env` the same way upstream's service does. Values are
+It reads `service.env` from the T3 home it serves, normally `~/.t3/service.env`,
+the same way upstream's service does. Values are
 literal `KEY=VALUE` with no shell expansion, and `PATH` and `T3CODE_HOME` are
 ignored:
 
@@ -139,7 +142,8 @@ does the service step with its own agent:
 - If it's running, it restarts it so the server reads the new settings. It
   asks first in a terminal. Without one it restarts right away, as upstream does.
 - If you set up a different T3 home with `--base-dir` or `T3CODE_HOME`, a
-  service serving another home is left alone.
+  running service that serves another home is left alone. With no service
+  installed, it installs one for the home you named.
 
 Any other failure keeps upstream's exit code. To pair a device after turning on
 the local network, run `t3 pair` and scan the code with the T3 Code app. To serve
@@ -155,7 +159,8 @@ on Intel, followed by the state of this wrapper's service.
 t3 uninstall
 ```
 
-It lists what it will remove and asks once (`--yes` skips the question):
+It lists what it will remove and asks once. `--yes` skips the question, and
+without a terminal it's required. It removes
 the background service, the wrapper, its state and config, and the checkout if
 the installer cloned it to the default path. A checkout you pointed it at with
 `T3_REPO` stays. So do `~/.t3` (projects, threads, and settings), vp, and Node.
@@ -192,6 +197,9 @@ agent after a crash and waits at least 10 seconds between attempts.
 - Builds run `vp i && vp run build:desktop`, as upstream documents.
 - Wrapper state lives in the checkout's git config: `t3.channel`, and
   `t3.built` for the last successful build.
+- The launchd agent runs `bin/t3 __service-run`, which loads `service.env` and
+  then runs `serve --no-browser` on the pinned Node. Its plist sets `PATH`,
+  `T3_REPO`, and the T3 home it serves.
 - `vp i` rewrites `pnpm-lock.yaml` on every build, so the wrapper resets that
   file before an update. Any other local change stops the update.
 
@@ -202,8 +210,9 @@ shellcheck bin/t3 install.sh
 bats test/
 ```
 
-The tests run against a fake upstream with release tags and stub `vp` and
-`node`, so they don't need network access or a real build. CI also runs a
+The tests run against a fake upstream with release tags, with stubs for `vp`,
+`node`, `launchctl`, `plutil`, and `uname`. They need no network access or real
+build, and they never touch your launchd agents, so they run on Linux too. CI also runs a
 weekly install and boot check on an Intel macOS runner.
 
 ## License
