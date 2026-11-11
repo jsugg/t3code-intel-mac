@@ -1,0 +1,431 @@
+#!/bin/bash
+# t3: run T3 Code on Intel Macs from a source build.
+# Upstream ships no darwin-x64 `t3` because Node single-executables segfault there,
+# so this wrapper builds the server from source and runs it on the pinned Node.
+# `t3 wrapper` lists the commands it adds; everything else goes to the server CLI.
+set -euo pipefail
+
+T3_WRAPPER_VERSION="0.1.0"
+T3_WRAPPER_REPO="jsugg/t3code-intel-mac"
+T3_UPSTREAM_URL="${T3_UPSTREAM_URL:-https://github.com/pingdotgg/t3code}"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/t3code-intel-mac/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t3code-intel-mac"
+DEFAULT_REPO="${XDG_DATA_HOME:-$HOME/.local/share}/t3code-intel-mac/t3code"
+
+LABEL="io.github.jsugg.t3code-intel-mac"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$HOME/Library/Logs/t3code-intel-mac"
+LOG_FILE="$LOG_DIR/server.log"
+
+die() { echo "t3: $*" >&2; exit 1; }
+say() { echo "t3: $*" >&2; }
+
+self_path() {
+  local dir
+  dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  echo "$dir/$(basename "${BASH_SOURCE[0]}")"
+}
+
+# Config is KEY=VALUE, read literally (never sourced). Env vars win over the file.
+config_get() {
+  local key="$1" line
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$key="*) unquote "${line#*=}"; return 0 ;; esac
+  done <"$CONFIG_FILE"
+}
+
+unquote() {
+  local v="$1"
+  case "$v" in
+    \"*\") v="${v#\"}"; v="${v%\"}" ;;
+    \'*\') v="${v#\'}"; v="${v%\'}" ;;
+  esac
+  printf '%s\n' "$v"
+}
+
+T3_REPO="${T3_REPO:-$(config_get T3_REPO)}"
+T3_REPO="${T3_REPO:-$DEFAULT_REPO}"
+T3_REPO="${T3_REPO/#\~/$HOME}"
+SERVER_BIN="$T3_REPO/apps/server/dist/bin.mjs"
+
+git_repo() { git -C "$T3_REPO" "$@"; }
+
+require_repo() {
+  git_repo rev-parse --git-dir >/dev/null 2>&1 ||
+    die "no t3code checkout at $T3_REPO (run the installer, or set T3_REPO in $CONFIG_FILE)"
+}
+
+confirm() {
+  local answer
+  if [ "${ASSUME_YES:-0}" = 1 ]; then return 0; fi
+  if ! { : </dev/tty; } 2>/dev/null; then return 1; fi
+  printf 't3: %s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty || return 1
+  case "$answer" in y | Y | yes | YES) return 0 ;; *) return 1 ;; esac
+}
+
+# --- Node and vp ---------------------------------------------------------------
+
+node_version() {
+  local v
+  v="$(sed -n 's/^ *"node": *"\([0-9][0-9.]*\)".*/\1/p' "$T3_REPO/package.json" | head -1)"
+  [ -n "$v" ] || die "could not read engines.node from $T3_REPO/package.json"
+  echo "$v"
+}
+
+load_vp() {
+  command -v vp >/dev/null && return 0
+  local env_file
+  for env_file in "${XDG_CONFIG_HOME:-$HOME/.config}/vite-plus/env" "$HOME/.vite-plus/env"; do
+    # vp's env script calls compdef when sourced; harmless outside zsh.
+    # shellcheck disable=SC1090
+    [ -f "$env_file" ] && . "$env_file" >/dev/null 2>&1 || true
+    command -v vp >/dev/null && return 0
+  done
+  die "vp not found; install it with: curl -fsSL https://vite.plus | VP_NODE_MANAGER=no bash"
+}
+
+# Sets NODE to an absolute path for the repo's pinned Node; vp downloads it on first use.
+resolve_node() {
+  if [ -n "${T3_NODE:-}" ]; then NODE="$T3_NODE"; return; fi
+  local v cache
+  v="$(node_version)"
+  cache="$STATE_DIR/node-$v"
+  if [ -f "$cache" ]; then
+    NODE="$(cat "$cache")"
+    case "$NODE" in */"$v"/* | */"v$v"/*) [ -x "$NODE" ] && return ;; esac
+  fi
+  load_vp
+  say "resolving Node $v through vp"
+  # Inside a project vp ignores --node and hands back the PATH node, so ask from /.
+  NODE="$(cd / && vp env exec --node "$v" node -p process.execPath)" || die "vp could not provide Node $v"
+  [ -x "$NODE" ] || die "vp returned an unusable Node path: $NODE"
+  [ "$("$NODE" --version)" = "v$v" ] || die "vp returned $NODE, which is not Node $v"
+  mkdir -p "$STATE_DIR"
+  echo "$NODE" >"$cache"
+}
+
+build() {
+  resolve_node
+  load_vp
+  say "building $(describe) with Node $("$NODE" --version)"
+  local path
+  path="$(dirname "$NODE"):$PATH"
+  (cd "$T3_REPO" && PATH="$path" vp i && PATH="$path" vp run build:desktop)
+}
+
+# --- Channels and updates ------------------------------------------------------
+
+describe() { git_repo describe --tags --exclude 'mobile-*' --always; }
+channel() { git_repo config t3.channel || echo stable; }
+
+# Commit of the last successful build. Pre-0.1 installs never recorded it, so a
+# built tree counts as HEAD.
+built_commit() {
+  git_repo config t3.built && return
+  [ -f "$SERVER_BIN" ] && git_repo rev-parse HEAD
+  return 0
+}
+
+# Releases are tags: vX.Y.Z (stable) and vX.Y.Z-nightly.YYYYMMDD.N (nightly).
+# main is the untagged tip, newer than either and never released.
+resolve_target() {
+  local ch="$1" pin="$2" tag
+  if [ -n "$pin" ]; then
+    tag="v${pin#v}"
+    git_repo rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "no release tag $tag"
+    echo "$tag"
+    return
+  fi
+  case "$ch" in
+    main) echo origin/main ;;
+    stable) tag="$(git_repo tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)" ;;
+    nightly) tag="$(git_repo tag -l 'v*-nightly.*' --sort=-v:refname | head -1)" ;;
+    *) die "unknown channel '$ch' (stable, nightly, main)" ;;
+  esac
+  [ "$ch" = main ] && return
+  [ -n "$tag" ] || die "no $ch release tag found"
+  echo "$tag"
+}
+
+ensure_clean() {
+  # `vp i` rewrites the lockfile on every build; anything else dirty is the user's.
+  git_repo checkout -q -- pnpm-lock.yaml 2>/dev/null || true
+  if ! git_repo diff --quiet || ! git_repo diff --cached --quiet; then
+    die "local changes in $T3_REPO; stash or commit them first"
+  fi
+}
+
+checkout() {
+  if [ "$1" = origin/main ]; then
+    git_repo checkout -q main
+    git_repo merge -q --ff-only origin/main
+  else
+    git_repo checkout -q "$1"
+  fi
+}
+
+# Restores branch pointers too, so a fast-forwarded main goes back to where it was.
+restore() {
+  local ref="$1" sha="$2"
+  if [ "$ref" = "$sha" ]; then git_repo checkout -q "$sha"; else git_repo checkout -q -B "$ref" "$sha"; fi
+}
+
+cmd_update() {
+  local ch pin="" allow_downgrade=0 target target_sha built prev_ref prev_sha
+  require_repo
+  ch="$(channel)"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channel) ch="${2:-}"; [ -n "$ch" ] || die "--channel needs a value"; shift ;;
+      --channel=*) ch="${1#--channel=}" ;;
+      --allow-downgrade) allow_downgrade=1 ;;
+      --yes | -y) ASSUME_YES=1 ;;
+      -*) die "unknown update flag '$1'" ;;
+      *) pin="$1" ;;
+    esac
+    shift
+  done
+
+  ensure_clean
+  git_repo fetch --tags --force -q origin
+  target="$(resolve_target "$ch" "$pin")"
+  target_sha="$(git_repo rev-parse "$target^{commit}")"
+  built="$(built_commit)"
+
+  if [ "$target_sha" = "$built" ] && [ -f "$SERVER_BIN" ]; then
+    [ -n "$pin" ] || git_repo config t3.channel "$ch"
+    say "already on $ch @ $(describe)"
+    return
+  fi
+  # Older releases can't read a database a newer one migrated.
+  if [ -n "$built" ] && git_repo merge-base --is-ancestor "$target_sha" "$built" && [ "$allow_downgrade" != 1 ]; then
+    die "$target is older than the current build ($(describe)); rerun with --allow-downgrade to accept the database risk"
+  fi
+
+  prev_sha="$(git_repo rev-parse HEAD)"
+  prev_ref="$(git_repo symbolic-ref -q --short HEAD || echo "$prev_sha")"
+  checkout "$target"
+  if ! build; then
+    say "build failed; restoring $prev_ref"
+    restore "$prev_ref" "$prev_sha"
+    build || die "restore build failed too; run 't3 rebuild' after fixing the error above"
+    die "update aborted; still on $(describe)"
+  fi
+  git_repo config t3.built "$target_sha"
+  [ -n "$pin" ] || git_repo config t3.channel "$ch"
+  say "now on ${pin:+pinned }${pin:-$ch} @ $(describe)"
+  after_build
+}
+
+cmd_rebuild() {
+  require_repo
+  build
+  git_repo config t3.built "$(git_repo rev-parse HEAD)"
+  after_build
+}
+
+# The old server keeps running until restarted; built-in `t3 update` asks first too.
+after_build() {
+  if service_loaded; then
+    if confirm "restart the background service now? Running agent turns and terminals stop"; then
+      service_restart
+    else
+      say "service still runs the old build; run 't3 service restart' when ready"
+    fi
+  fi
+  if pgrep -f "$SERVER_BIN" >/dev/null 2>&1 && ! service_loaded; then
+    say "a server started by hand is still running the old build; restart it to pick up the new one"
+  fi
+  return 0
+}
+
+# --- launchd service -----------------------------------------------------------
+
+uid() { id -u; }
+service_loaded() { launchctl print "gui/$(uid)/$LABEL" >/dev/null 2>&1; }
+
+xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+
+write_plist() {
+  local self path home
+  self="$(xml_escape "$(self_path)")"
+  # launchd starts with a bare PATH; keep the installer's so provider CLIs resolve.
+  path="$(xml_escape "$PATH")"
+  home="$(xml_escape "$HOME")"
+  mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$self</string>
+    <string>__service-run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$path</string>
+    <key>T3_REPO</key><string>$(xml_escape "$T3_REPO")</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$home</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "$LOG_FILE")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$LOG_FILE")</string>
+</dict>
+</plist>
+EOF
+  plutil -lint -s "$PLIST" || die "generated an invalid plist at $PLIST"
+}
+
+# bootout returns before launchd lets go of the job; bootstrapping too early fails with EIO.
+service_unload() {
+  local _
+  service_loaded || return 0
+  launchctl bootout "gui/$(uid)/$LABEL" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    service_loaded || return 0
+    sleep 0.5
+  done
+  die "launchd still holds $LABEL; check 'launchctl print gui/$(uid)/$LABEL'"
+}
+
+service_restart() { launchctl kickstart -k "gui/$(uid)/$LABEL"; say "service restarted; the server takes ~15s to answer again"; }
+
+# Mirrors upstream's service.env: literal KEY=VALUE, no expansion, PATH and T3 home protected.
+load_service_env() {
+  local file="${T3CODE_HOME:-$HOME/.t3}/service.env" line key value
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | \#*) continue ;; esac
+    key="${line%%=*}"
+    value="$(unquote "${line#*=}")"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "$(tr '[:lower:]' '[:upper:]' <<<"$key")" in PATH | T3CODE_HOME) continue ;; esac
+    export "$key=$value"
+  done <"$file"
+}
+
+cmd_service() {
+  [ "$(uname -s)" = Darwin ] || die "t3 service manages a launchd agent and needs macOS"
+  case "${1:-status}" in
+    install)
+      require_repo
+      [ -f "$SERVER_BIN" ] || die "server not built; run 't3 rebuild' first"
+      service_unload
+      write_plist
+      launchctl bootstrap "gui/$(uid)" "$PLIST"
+      say "service installed; it starts at login. Logs: $LOG_FILE"
+      ;;
+    uninstall)
+      service_unload
+      rm -f "$PLIST"
+      say "service removed; projects, threads, and settings under ~/.t3 are kept"
+      ;;
+    restart)
+      service_loaded || die "service not installed; run 't3 service install'"
+      service_restart
+      ;;
+    status)
+      if service_loaded; then
+        launchctl print "gui/$(uid)/$LABEL" | grep -E '^[[:space:]]*(state|pid|last exit code) =' | sed 's/^[[:space:]]*/  /'
+        echo "  plist = $PLIST"
+        echo "  log = $LOG_FILE"
+      else
+        echo "  not installed"
+      fi
+      ;;
+    logs)
+      [ -f "$LOG_FILE" ] || die "no log yet at $LOG_FILE"
+      if [ "${2:-}" = -f ]; then tail -n 100 -f "$LOG_FILE"; else tail -n 200 "$LOG_FILE"; fi
+      ;;
+    *) die "usage: t3 service install|uninstall|restart|status|logs [-f]" ;;
+  esac
+}
+
+# --- Wrapper maintenance -------------------------------------------------------
+
+cmd_self_update() {
+  local self tmp url
+  self="$(self_path)"
+  [ -L "${BASH_SOURCE[0]}" ] && die "$self is a symlink (dev install); update its checkout with git instead"
+  url="https://raw.githubusercontent.com/$T3_WRAPPER_REPO/main/bin/t3"
+  tmp="$(mktemp "${self}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  curl -fsSL "$url" -o "$tmp" || die "download failed: $url"
+  bash -n "$tmp" || die "downloaded wrapper does not parse; keeping the current one"
+  if cmp -s "$tmp" "$self"; then say "wrapper already up to date ($T3_WRAPPER_VERSION)"; return; fi
+  chmod +x "$tmp"
+  mv "$tmp" "$self"
+  trap - EXIT
+  say "wrapper updated to $(sed -n 's/^T3_WRAPPER_VERSION="\(.*\)"/\1/p' "$self" | head -1)"
+}
+
+cmd_uninstall() {
+  local self remove_repo=0
+  case "${1:-}" in --yes | -y) ASSUME_YES=1 ;; esac
+  self="$(self_path)"
+  echo "This removes:"
+  [ -f "$PLIST" ] && echo "  background service  $PLIST"
+  echo "  wrapper             $self"
+  [ -d "$STATE_DIR" ] && echo "  wrapper state       $STATE_DIR"
+  [ -f "$CONFIG_FILE" ] && echo "  wrapper config      $(dirname "$CONFIG_FILE")"
+  if [ "$T3_REPO" = "$DEFAULT_REPO" ] && [ -d "$T3_REPO" ]; then
+    remove_repo=1
+    echo "  source checkout     $(dirname "$T3_REPO")"
+  fi
+  echo "Kept: ~/.t3 (projects, threads, settings), vp, and Node."
+  confirm "continue?" || die "nothing removed"
+  if [ "$(uname -s)" = Darwin ]; then cmd_service uninstall; fi
+  rm -rf "$STATE_DIR" "$(dirname "$CONFIG_FILE")"
+  [ "$remove_repo" = 1 ] && rm -rf "$(dirname "$T3_REPO")"
+  rm -f "$self"
+  say "uninstalled"
+}
+
+cmd_wrapper_help() {
+  cat <<EOF
+t3code-intel-mac $T3_WRAPPER_VERSION  (checkout: $T3_REPO)
+
+Wrapper commands:
+  t3 update [VERSION] [--channel stable|nightly|main] [--allow-downgrade] [--yes]
+                       check out a release and rebuild; the channel sticks
+  t3 rebuild           reinstall dependencies and rebuild the current checkout
+  t3 channel           show the channel and version
+  t3 service install|uninstall|restart|status|logs [-f]
+                       run the server as a launchd agent at login
+  t3 repo              print the checkout path
+  t3 self-update       fetch the latest wrapper from github.com/$T3_WRAPPER_REPO
+  t3 uninstall [--yes] remove the wrapper, its service, and a default checkout
+  t3 wrapper           show this help
+
+Everything else runs the T3 Code server CLI: t3, t3 serve, t3 up, t3 --help.
+EOF
+}
+
+run_server() {
+  require_repo
+  [ -f "$SERVER_BIN" ] || die "server not built; run 't3 rebuild'"
+  resolve_node
+  exec "$NODE" "$SERVER_BIN" "$@"
+}
+
+case "${1:-}" in
+  update) shift; cmd_update "$@" ;;
+  rebuild) cmd_rebuild ;;
+  channel) require_repo; echo "$(channel) @ $(describe)" ;;
+  repo) echo "$T3_REPO" ;;
+  service) shift; cmd_service "$@" ;;
+  self-update) cmd_self_update ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  wrapper) cmd_wrapper_help ;;
+  __service-run) load_service_env; run_server serve --no-browser ;;
+  *) run_server "$@" ;;
+esac

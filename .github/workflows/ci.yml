@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck bin/t3 install.sh && shellcheck -s bash test/t3.bats
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: |
+          if command -v brew >/dev/null && [ "$RUNNER_OS" = macOS ]; then brew install bats-core
+          else sudo apt-get update -q && sudo apt-get install -yq bats; fi
+      - run: bats test/
+
+  # Real install and boot on Intel macOS: slow, so only weekly and on demand.
+  intel-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: ./install.sh
+      - name: Boot the server
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          t3 channel
+          t3 --version
+          t3 serve --no-browser --port 37773 >server.log 2>&1 &
+          for _ in $(seq 1 90); do
+            if curl -fs -o /dev/null http://127.0.0.1:37773/; then echo up; exit 0; fi
+            sleep 1
+          done
+          cat server.log
+          exit 1
