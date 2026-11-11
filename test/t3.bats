@@ -348,3 +348,43 @@ EOF2
   [ "$status" -eq 0 ]
   [ "$output" = '{"service":{}}' ]
 }
+
+# self-update rewrites the running file, so these work on a copy of the wrapper.
+self_update_setup() {
+  mkdir -p "$BATS_TEST_TMPDIR/bin"
+  cp "$T3" "$BATS_TEST_TMPDIR/bin/t3"
+  stub curl <<'EOF2'
+out=""
+prev=""
+for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; done
+cp "$STUB_DOWNLOAD" "$out"
+EOF2
+}
+
+@test "self-update with nothing new leaves no temp file behind" {
+  self_update_setup
+  STUB_DOWNLOAD="$BATS_TEST_TMPDIR/bin/t3" run "$BATS_TEST_TMPDIR/bin/t3" self-update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already up to date"* ]]
+  [[ "$output" != *"unbound"* ]]
+  [ "$(ls "$BATS_TEST_TMPDIR/bin")" = t3 ]
+}
+
+@test "self-update replaces the wrapper with a newer version" {
+  self_update_setup
+  sed 's/^T3_WRAPPER_VERSION=.*/T3_WRAPPER_VERSION="9.9.9"/' "$T3" >"$BATS_TEST_TMPDIR/new"
+  STUB_DOWNLOAD="$BATS_TEST_TMPDIR/new" run "$BATS_TEST_TMPDIR/bin/t3" self-update
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"updated to 9.9.9"* ]]
+  [ -x "$BATS_TEST_TMPDIR/bin/t3" ]
+  [ "$(ls "$BATS_TEST_TMPDIR/bin")" = t3 ]
+}
+
+@test "self-update refuses a download that doesn't parse" {
+  self_update_setup
+  echo 'if then fi (' >"$BATS_TEST_TMPDIR/broken"
+  STUB_DOWNLOAD="$BATS_TEST_TMPDIR/broken" run "$BATS_TEST_TMPDIR/bin/t3" self-update
+  [ "$status" -ne 0 ]
+  cmp -s "$T3" "$BATS_TEST_TMPDIR/bin/t3"
+  [ "$(ls "$BATS_TEST_TMPDIR/bin")" = t3 ]
+}

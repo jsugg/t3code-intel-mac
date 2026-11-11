@@ -5,7 +5,7 @@
 # `t3 wrapper` lists the commands it adds; everything else goes to the server CLI.
 set -euo pipefail
 
-T3_WRAPPER_VERSION="0.3.0"
+T3_WRAPPER_VERSION="0.3.1"
 T3_WRAPPER_REPO="jsugg/t3code-intel-mac"
 T3_UPSTREAM_URL="${T3_UPSTREAM_URL:-https://github.com/pingdotgg/t3code}"
 
@@ -393,19 +393,25 @@ cmd_service() {
 
 # --- Wrapper maintenance -------------------------------------------------------
 
+# Global, not local: the EXIT trap runs after this function's scope is gone.
+SELF_UPDATE_TMP=""
+
 cmd_self_update() {
-  local self tmp url
+  local self url
   self="$(self_path)"
   [ -L "${BASH_SOURCE[0]}" ] && die "$self is a symlink (dev install); update its checkout with git instead"
-  url="https://raw.githubusercontent.com/$T3_WRAPPER_REPO/main/bin/t3"
-  tmp="$(mktemp "${self}.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
-  curl -fsSL "$url" -o "$tmp" || die "download failed: $url"
-  bash -n "$tmp" || die "downloaded wrapper does not parse; keeping the current one"
-  if cmp -s "$tmp" "$self"; then say "wrapper already up to date ($T3_WRAPPER_VERSION)"; return; fi
-  chmod +x "$tmp"
-  mv "$tmp" "$self"
-  trap - EXIT
+  url="${T3_WRAPPER_URL:-https://raw.githubusercontent.com/$T3_WRAPPER_REPO/main/bin/t3}"
+  SELF_UPDATE_TMP="$(mktemp "${self}.XXXXXX")"
+  trap 'rm -f -- "$SELF_UPDATE_TMP"' EXIT
+  curl -fsSL "$url" -o "$SELF_UPDATE_TMP" || die "download failed: $url"
+  bash -n "$SELF_UPDATE_TMP" || die "downloaded wrapper does not parse; keeping the current one"
+  if cmp -s "$SELF_UPDATE_TMP" "$self"; then
+    say "wrapper already up to date ($T3_WRAPPER_VERSION)"
+    return
+  fi
+  chmod +x "$SELF_UPDATE_TMP"
+  mv "$SELF_UPDATE_TMP" "$self"
+  SELF_UPDATE_TMP=""
   say "wrapper updated to $(sed -n 's/^T3_WRAPPER_VERSION="\(.*\)"/\1/p' "$self" | head -1)"
 }
 
