@@ -140,7 +140,7 @@ build() {
 # --- Releases ------------------------------------------------------------------
 # The server bundle loads hashed chunks on demand and a build wipes dist/, so a
 # server must never run from the checkout being rebuilt. Each good build is
-# snapshotted into releases/<time>-<commit> and the server runs from `current`.
+# snapshotted into releases/<seq>-<time>-<commit> and the server runs from `current`.
 # Servers are launched with the resolved path, so flipping `current` never
 # changes files under a running one.
 
@@ -181,10 +181,12 @@ clone_path() {
 }
 
 make_release() {
-  local sha id tmp entry
+  local sha seq id tmp entry
   sha="$(git_repo rev-parse HEAD)"
-  id="$(date +%Y%m%d%H%M%S)-${sha:0:12}"
-  while [ -e "$RELEASES_DIR/$id" ]; do id="$id-1"; done
+  mkdir -p "$RELEASES_DIR"
+  seq="$(list_releases | head -1)"
+  seq="$(release_seq "$(basename "${seq:-0}")")"
+  id="$(printf '%06d' $((seq + 1)))-$(date +%Y%m%d%H%M%S)-${sha:0:12}"
   tmp="$RELEASES_DIR/.incoming-$id"
   mkdir -p "$tmp"
   say "snapshotting the build"
@@ -206,6 +208,24 @@ make_release() {
 # shellcheck disable=SC2001
 regex_escape() { sed 's/[][\.*^$+?(){}|]/\\&/g' <<<"$1"; }
 count_procs() { pgrep -f -- "$1" 2>/dev/null | grep -c . || true; }
+# Names start with a sequence number so they order by creation even within one
+# second. Snapshots named before that (time-commit) count as the oldest.
+release_seq() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9][0-9][0-9]-*) echo "$((10#${1%%-*}))" ;;
+    *) echo 0 ;;
+  esac
+}
+
+# Release directories, newest first.
+list_releases() {
+  local dir
+  [ -d "$RELEASES_DIR" ] || return 0
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | while IFS= read -r dir; do
+    printf '%s\t%s\n' "$(release_seq "$(basename "$dir")")" "$dir"
+  done | sort -t "$(printf '\t')" -k1,1nr | cut -f2-
+}
+
 release_in_use() { [ "$(count_procs "$(regex_escape "$1")/")" -gt 0 ]; }
 
 # Keeps the newest KEEP_RELEASES and any release a running server still uses.
@@ -220,7 +240,7 @@ prune_releases() {
     fi
     if release_in_use "$dir"; then continue; fi
     rm -rf "$dir"
-  done < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort -r)
+  done < <(list_releases)
   # Leftovers from an interrupted snapshot.
   find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -name '.incoming-*' -exec rm -rf {} +
 }
