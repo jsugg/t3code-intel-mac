@@ -7,6 +7,8 @@ setup() {
   export HOME="$BATS_TEST_TMPDIR/home"
   export XDG_CONFIG_HOME="$HOME/.config" XDG_STATE_HOME="$HOME/.state" XDG_DATA_HOME="$HOME/.data"
   export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  # launchd labels are per user, not per HOME; never touch a real install's agent.
+  export T3_SERVICE_LABEL="test.t3code-intel-mac.$$"
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com
   mkdir -p "$HOME" "$BATS_TEST_TMPDIR/stubs"
 
@@ -212,4 +214,40 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"t3 update"* ]]
   [[ "$output" == *"t3 service install"* ]]
+}
+
+@test "t3 up treats upstream's darwin-x64 service failure as expected" {
+  "$T3" update --channel stable --yes
+  export T3CODE_HOME="$HOME/.t3"
+  mkdir -p "$T3CODE_HOME"
+  stub node <<'EOF2'
+echo "T3CODE_LAN=true" >"$T3CODE_HOME/service.env"
+echo "ERROR: Background setup failed while selecting a t3 release archive for darwin-x64."
+exit 1
+EOF2
+  run "$T3" up --lan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ignore the darwin-x64 error above"* ]]
+  [[ "$output" == *"t3 service install"* ]]
+}
+
+@test "other t3 up failures keep their exit code" {
+  "$T3" update --channel stable --yes
+  stub node <<'EOF2'
+echo "something else broke"
+exit 3
+EOF2
+  run "$T3" up --lan
+  [ "$status" -eq 3 ]
+  [[ "$output" != *"darwin-x64"* ]]
+}
+
+@test "t3 status --json is passed through untouched" {
+  "$T3" update --channel stable --yes
+  stub node <<'EOF2'
+echo '{"service":{}}'
+EOF2
+  run "$T3" status --json
+  [ "$status" -eq 0 ]
+  [ "$output" = '{"service":{}}' ]
 }

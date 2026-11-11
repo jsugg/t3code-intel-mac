@@ -57,6 +57,7 @@ t3 wrapper              # list the commands this wrapper adds
 | `t3 channel` | Show channel and version |
 | `t3 service install` | Run the server as a launchd agent that starts at login |
 | `t3 service status` / `restart` / `logs [-f]` / `uninstall` | Manage that agent |
+| `t3 up`, `t3 connect` | Upstream remote access setup, applied to this wrapper's service |
 | `t3 self-update` | Replace the wrapper with the latest version from this repo |
 | `t3 uninstall` | Remove the wrapper, its service, and a default checkout |
 
@@ -89,6 +90,20 @@ ignored:
 T3CODE_PORT=3773
 T3CODE_HOST=127.0.0.1
 ```
+
+### Remote access
+
+`t3 up` and `t3 connect` run upstream's commands. They save your T3 Connect
+sign-in and LAN choice, then try to install upstream's own background service.
+That step always fails on Intel, because it downloads a darwin-x64 release
+archive that doesn't exist. The wrapper recognizes that one error and offers to
+restart its own service so the server picks up the new settings. Any other
+failure keeps its exit code.
+
+`t3 status` prints upstream's status, which always says "Service not installed"
+on Intel, followed by the state of this wrapper's service.
+
+### Updates and the service
 
 After `t3 update`, the wrapper asks before restarting the service, because a
 restart stops running agent turns and terminals. Pass `--yes` to skip the

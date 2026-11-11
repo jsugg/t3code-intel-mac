@@ -5,7 +5,7 @@
 # `t3 wrapper` lists the commands it adds; everything else goes to the server CLI.
 set -euo pipefail
 
-T3_WRAPPER_VERSION="0.1.0"
+T3_WRAPPER_VERSION="0.2.0"
 T3_WRAPPER_REPO="jsugg/t3code-intel-mac"
 T3_UPSTREAM_URL="${T3_UPSTREAM_URL:-https://github.com/pingdotgg/t3code}"
 
@@ -13,7 +13,7 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/t3code-intel-mac/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t3code-intel-mac"
 DEFAULT_REPO="${XDG_DATA_HOME:-$HOME/.local/share}/t3code-intel-mac/t3code"
 
-LABEL="io.github.jsugg.t3code-intel-mac"
+LABEL="${T3_SERVICE_LABEL:-io.github.jsugg.t3code-intel-mac}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/t3code-intel-mac"
 LOG_FILE="$LOG_DIR/server.log"
@@ -297,6 +297,15 @@ service_unload() {
   die "launchd still holds $LABEL; check 'launchctl print gui/$(uid)/$LABEL'"
 }
 
+service_summary() {
+  local info state pid
+  service_loaded || { echo "not installed"; return; }
+  info="$(launchctl print "gui/$(uid)/$LABEL")"
+  state="$(sed -n 's/^[[:space:]]*state = //p' <<<"$info" | head -1)"
+  pid="$(sed -n 's/^[[:space:]]*pid = //p' <<<"$info" | head -1)"
+  echo "${state:-unknown}${pid:+ · pid $pid}"
+}
+
 service_restart() { launchctl kickstart -k "gui/$(uid)/$LABEL"; say "service restarted; the server takes ~15s to answer again"; }
 
 # Mirrors upstream's service.env: literal KEY=VALUE, no expansion, PATH and T3 home protected.
@@ -406,15 +415,73 @@ Wrapper commands:
   t3 uninstall [--yes] remove the wrapper, its service, and a default checkout
   t3 wrapper           show this help
 
-Everything else runs the T3 Code server CLI: t3, t3 serve, t3 up, t3 --help.
+  t3 up, t3 connect    upstream remote access; the wrapper's service applies the result
+  t3 status            upstream status plus this wrapper's service
+
+Everything else runs the T3 Code server CLI: t3, t3 serve, t3 pair, t3 --help.
 EOF
 }
 
-run_server() {
+prepare_server() {
   require_repo
   [ -f "$SERVER_BIN" ] || die "server not built; run 't3 rebuild'"
   resolve_node
+}
+
+run_server() {
+  prepare_server
   exec "$NODE" "$SERVER_BIN" "$@"
+}
+
+service_env_file() { echo "${T3CODE_HOME:-$HOME/.t3}/service.env"; }
+file_sum() { [ -f "$1" ] && cksum <"$1" || echo none; }
+
+# Upstream `t3 up` and `t3 connect` save the access settings first, then try to
+# install upstream's own service, which needs a darwin-x64 release archive that
+# doesn't exist. That last step fails with a known error; the settings stand.
+cmd_access() {
+  local log status=0 env_before arg
+  prepare_server
+  for arg in "$@"; do case "$arg" in --yes | -y) ASSUME_YES=1 ;; esac; done
+  env_before="$(file_sum "$(service_env_file)")"
+  log="$(mktemp "${TMPDIR:-/tmp}/t3-up.XXXXXX")"
+  if [ -t 0 ] && [ -t 1 ] && [ "$(uname -s)" = Darwin ]; then
+    # script(1) keeps prompts and sign-in interactive while recording the output.
+    script -q "$log" "$NODE" "$SERVER_BIN" "$@" || status=$?
+  else
+    "$NODE" "$SERVER_BIN" "$@" 2>&1 | tee "$log" || status=$?
+  fi
+  if [ "$status" -ne 0 ] && grep -q 'release archive for darwin-x64' "$log"; then
+    status=0
+    say "ignore the darwin-x64 error above: upstream's own service can't install on Intel Macs"
+    say "your access settings are saved; this wrapper's service applies them"
+  elif [ "$status" -ne 0 ] || [ "$env_before" = "$(file_sum "$(service_env_file)")" ]; then
+    rm -f "$log"
+    return "$status"
+  fi
+  rm -f "$log"
+  if service_loaded; then
+    if confirm "restart the background service to apply them? Running agent turns stop"; then
+      service_restart
+    else
+      say "run 't3 service restart' to apply them"
+    fi
+  else
+    say "run 't3 service install' to serve with them in the background, or 't3 serve' in a terminal"
+  fi
+}
+
+# Upstream's status can't see this wrapper's launchd agent, so report it too.
+cmd_status() {
+  local status=0 arg
+  prepare_server
+  "$NODE" "$SERVER_BIN" status "$@" || status=$?
+  for arg in "$@"; do [ "$arg" = --json ] && return "$status"; done
+  if [ "$(uname -s)" = Darwin ]; then
+    echo
+    echo "Intel Mac service (t3 service): $(service_summary)"
+  fi
+  return "$status"
 }
 
 case "${1:-}" in
@@ -426,6 +493,8 @@ case "${1:-}" in
   self-update) cmd_self_update ;;
   uninstall) shift; cmd_uninstall "$@" ;;
   wrapper) cmd_wrapper_help ;;
+  up | connect) cmd_access "$@" ;;
+  status) shift; cmd_status "$@" ;;
   __service-run) load_service_env; run_server serve --no-browser ;;
   *) run_server "$@" ;;
 esac
