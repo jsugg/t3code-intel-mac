@@ -5,7 +5,7 @@
 # `t3 wrapper` lists the commands it adds; everything else goes to the server CLI.
 set -euo pipefail
 
-T3_WRAPPER_VERSION="0.2.0"
+T3_WRAPPER_VERSION="0.3.0"
 T3_WRAPPER_REPO="jsugg/t3code-intel-mac"
 T3_UPSTREAM_URL="${T3_UPSTREAM_URL:-https://github.com/pingdotgg/t3code}"
 
@@ -13,10 +13,12 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/t3code-intel-mac/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t3code-intel-mac"
 DEFAULT_REPO="${XDG_DATA_HOME:-$HOME/.local/share}/t3code-intel-mac/t3code"
 
-LABEL="${T3_SERVICE_LABEL:-io.github.jsugg.t3code-intel-mac}"
+DEFAULT_LABEL="io.github.jsugg.t3code-intel-mac"
+LABEL="${T3_SERVICE_LABEL:-$DEFAULT_LABEL}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/t3code-intel-mac"
 LOG_FILE="$LOG_DIR/server.log"
+[ "$LABEL" = "$DEFAULT_LABEL" ] || LOG_FILE="$LOG_DIR/$LABEL.log"
 
 die() { echo "t3: $*" >&2; exit 1; }
 say() { echo "t3: $*" >&2; }
@@ -57,13 +59,27 @@ require_repo() {
     die "no t3code checkout at $T3_REPO (run the installer, or set T3_REPO in $CONFIG_FILE)"
 }
 
+# Prompts need a terminal on both ends, as upstream's do.
+interactive() { [ "${T3_NONINTERACTIVE:-0}" != 1 ] && [ -t 0 ] && [ -t 1 ]; }
+
+# confirm MESSAGE [DEFAULT]: DEFAULT (yes or no) is the answer without a terminal.
 confirm() {
   local answer
-  if [ "${ASSUME_YES:-0}" = 1 ]; then return 0; fi
-  if ! { : </dev/tty; } 2>/dev/null; then return 1; fi
-  printf 't3: %s [y/N] ' "$1" >/dev/tty
-  read -r answer </dev/tty || return 1
+  [ "${ASSUME_YES:-0}" = 1 ] && return 0
+  if ! interactive; then
+    [ "${2:-no}" = yes ] && return 0
+    return 1
+  fi
+  printf 't3: %s [y/N] ' "$1" >&2
+  read -r answer || return 1
   case "$answer" in y | Y | yes | YES) return 0 ;; *) return 1 ;; esac
+}
+
+# Absolute, symlink-free form of a directory, so ~/.t3 and $HOME/.t3/ compare equal.
+canonical_dir() {
+  local d="${1/#\~/$HOME}"
+  d="${d%/}"
+  if [ -d "$d" ]; then (cd "$d" && pwd -P); else echo "$d"; fi
 }
 
 # --- Node and vp ---------------------------------------------------------------
@@ -248,13 +264,26 @@ uid() { id -u; }
 service_loaded() { launchctl print "gui/$(uid)/$LABEL" >/dev/null 2>&1; }
 
 xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+xml_unescape() { sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'; }
+
+# The T3 home the installed agent serves: T3CODE_HOME from its plist, else ~/.t3.
+service_home() {
+  local h=""
+  if [ -f "$PLIST" ]; then
+    h="$(sed -n 's|.*<key>T3CODE_HOME</key><string>\(.*\)</string>.*|\1|p' "$PLIST" | head -1 | xml_unescape)"
+  fi
+  canonical_dir "${h:-$HOME/.t3}"
+}
 
 write_plist() {
-  local self path home
+  local self path home t3home=""
   self="$(xml_escape "$(self_path)")"
   # launchd starts with a bare PATH; keep the installer's so provider CLIs resolve.
   path="$(xml_escape "$PATH")"
   home="$(xml_escape "$HOME")"
+  if [ -n "${T3CODE_HOME:-}" ]; then
+    t3home="    <key>T3CODE_HOME</key><string>$(xml_escape "$(canonical_dir "$T3CODE_HOME")")</string>"
+  fi
   mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
   cat >"$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -272,6 +301,7 @@ write_plist() {
   <dict>
     <key>PATH</key><string>$path</string>
     <key>T3_REPO</key><string>$(xml_escape "$T3_REPO")</string>
+$t3home
   </dict>
   <key>WorkingDirectory</key><string>$home</string>
   <key>RunAtLoad</key><true/>
@@ -323,6 +353,7 @@ load_service_env() {
 }
 
 cmd_service() {
+  local home
   [ "$(uname -s)" = Darwin ] || die "t3 service manages a launchd agent and needs macOS"
   case "${1:-status}" in
     install)
@@ -331,12 +362,13 @@ cmd_service() {
       service_unload
       write_plist
       launchctl bootstrap "gui/$(uid)" "$PLIST"
-      say "service installed; it starts at login. Logs: $LOG_FILE"
+      say "service installed for $(service_home); it starts at login. Logs: $LOG_FILE"
       ;;
     uninstall)
+      home="$(service_home)"
       service_unload
       rm -f "$PLIST"
-      say "service removed; projects, threads, and settings under ~/.t3 are kept"
+      say "service removed; projects, threads, and settings under $home are kept"
       ;;
     restart)
       service_loaded || die "service not installed; run 't3 service install'"
@@ -415,7 +447,7 @@ Wrapper commands:
   t3 uninstall [--yes] remove the wrapper, its service, and a default checkout
   t3 wrapper           show this help
 
-  t3 up, t3 connect    upstream remote access; the wrapper's service applies the result
+  t3 up, t3 connect    upstream remote access; installs or restarts the wrapper's service
   t3 status            upstream status plus this wrapper's service
 
 Everything else runs the T3 Code server CLI: t3, t3 serve, t3 pair, t3 --help.
@@ -433,19 +465,27 @@ run_server() {
   exec "$NODE" "$SERVER_BIN" "$@"
 }
 
-service_env_file() { echo "${T3CODE_HOME:-$HOME/.t3}/service.env"; }
 file_sum() { [ -f "$1" ] && cksum <"$1" || echo none; }
 
-# Upstream `t3 up` and `t3 connect` save the access settings first, then try to
-# install upstream's own service, which needs a darwin-x64 release archive that
-# doesn't exist. That last step fails with a known error; the settings stand.
+# Upstream `t3 up` and `t3 connect` save the access settings, then install and
+# start upstream's own service. That step needs a darwin-x64 release archive
+# that doesn't exist, so it fails with a known error. The wrapper's agent then
+# does what upstream's would: start with the new settings, or restart to read them.
 cmd_access() {
-  local log status=0 env_before arg
+  local log status=0 env_before arg prev="" home="" wants_service=0
   prepare_server
-  for arg in "$@"; do case "$arg" in --yes | -y) ASSUME_YES=1 ;; esac; done
-  env_before="$(file_sum "$(service_env_file)")"
+  for arg in "$@"; do
+    [ "$prev" = --base-dir ] && home="$arg"
+    case "$arg" in
+      --yes | -y) ASSUME_YES=1 ;;
+      --base-dir=*) home="${arg#--base-dir=}" ;;
+    esac
+    prev="$arg"
+  done
+  home="$(canonical_dir "${home:-${T3CODE_HOME:-$HOME/.t3}}")"
+  env_before="$(file_sum "$home/service.env")"
   log="$(mktemp "${TMPDIR:-/tmp}/t3-up.XXXXXX")"
-  if [ -t 0 ] && [ -t 1 ] && [ "$(uname -s)" = Darwin ]; then
+  if interactive && [ "$(uname -s)" = Darwin ]; then
     # script(1) keeps prompts and sign-in interactive while recording the output.
     script -q "$log" "$NODE" "$SERVER_BIN" "$@" || status=$?
   else
@@ -453,21 +493,32 @@ cmd_access() {
   fi
   if [ "$status" -ne 0 ] && grep -q 'release archive for darwin-x64' "$log"; then
     status=0
-    say "ignore the darwin-x64 error above: upstream's own service can't install on Intel Macs"
-    say "your access settings are saved; this wrapper's service applies them"
-  elif [ "$status" -ne 0 ] || [ "$env_before" = "$(file_sum "$(service_env_file)")" ]; then
-    rm -f "$log"
-    return "$status"
+    wants_service=1
+    say "ignore the darwin-x64 error above: upstream's service can't install on Intel Macs, so this wrapper's service takes its place"
   fi
   rm -f "$log"
+  [ "$status" -eq 0 ] || return "$status"
+  # Upstream may have just created the home; resolve symlinks like /var -> /private/var now.
+  home="$(canonical_dir "$home")"
+  if [ "$wants_service" = 0 ] && [ "$env_before" = "$(file_sum "$home/service.env")" ]; then
+    return 0
+  fi
+  [ "$(uname -s)" = Darwin ] || return 0
+
   if service_loaded; then
-    if confirm "restart the background service to apply them? Running agent turns stop"; then
+    if [ "$(service_home)" != "$home" ]; then
+      say "the wrapper's service serves $(service_home), not $home, so it was left alone"
+      return 0
+    fi
+    # Upstream restarts without asking when there's no terminal; so does this.
+    if confirm "restart the background service to apply the new settings? Running agent turns stop" yes; then
       service_restart
     else
       say "run 't3 service restart' to apply them"
     fi
-  else
-    say "run 't3 service install' to serve with them in the background, or 't3 serve' in a terminal"
+  elif [ "$wants_service" = 1 ]; then
+    # Upstream installs its service here without asking.
+    T3CODE_HOME="$home" cmd_service install
   fi
 }
 

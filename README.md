@@ -82,7 +82,7 @@ t3 wrapper              # list the commands this wrapper adds
 | `t3 channel` | Show channel and version |
 | `t3 service install` | Run the server as a launchd agent that starts at login |
 | `t3 service status` / `restart` / `logs [-f]` / `uninstall` | Manage that agent |
-| `t3 up`, `t3 connect` | Upstream remote access setup, applied to this wrapper's service |
+| `t3 up`, `t3 connect` | Upstream remote access setup; installs or restarts this wrapper's service |
 | `t3 self-update` | Replace the wrapper with the latest version from this repo |
 | `t3 uninstall` | Remove the wrapper, its service, and a default checkout |
 
@@ -107,10 +107,11 @@ old build until you restart it.
 ### Background service
 
 `t3 service install` writes `~/Library/LaunchAgents/io.github.jsugg.t3code-intel-mac.plist`.
-The agent runs `t3 serve --no-browser` on `127.0.0.1:3773` and logs to
+The agent runs `t3 serve --no-browser`, by default on `127.0.0.1:3773`, and logs to
 `~/Library/Logs/t3code-intel-mac/server.log`. It copies your current `PATH`
 so the server can find provider CLIs, so run `t3 service install` again after
-you install a new one.
+you install a new one. It serves `~/.t3`; run `T3CODE_HOME=/other/home t3 service install`
+to serve another T3 home.
 
 It reads `~/.t3/service.env` the same way upstream's service does. Values are
 literal `KEY=VALUE` with no shell expansion, and `PATH` and `T3CODE_HOME` are
@@ -123,12 +124,27 @@ T3CODE_HOST=127.0.0.1
 
 ### Remote access
 
-`t3 up` and `t3 connect` run upstream's commands. They save your T3 Connect
-sign-in and LAN choice, then try to install upstream's own background service.
-That step always fails on Intel, because it downloads a darwin-x64 release
-archive that doesn't exist. The wrapper recognizes that one error and offers to
-restart its own service so the server picks up the new settings. Any other
-failure keeps its exit code.
+`t3 up` and `t3 connect` are upstream's own commands with upstream's flags:
+`--connect`, `--lan`, their `--no-` forms, `--yes`, and `--headless`. Run them
+on this Mac, not on the device you want to connect. A plain `t3 up` asks which
+routes to allow, T3 Connect or the local network.
+
+Upstream saves your choice, then installs and starts its own background
+service. That last step can't work on Intel, because it downloads a darwin-x64
+release binary that doesn't exist. The wrapper recognizes that one error and
+does the service step with its own agent:
+
+- If the wrapper's service isn't installed, it installs and starts it, as
+  upstream would.
+- If it's running, it restarts it so the server reads the new settings. It
+  asks first in a terminal. Without one it restarts right away, as upstream does.
+- If you set up a different T3 home with `--base-dir` or `T3CODE_HOME`, a
+  service serving another home is left alone.
+
+Any other failure keeps upstream's exit code. To pair a device after turning on
+the local network, run `t3 pair` and scan the code with the T3 Code app. To serve
+from a terminal instead of the background, `t3 serve --lan` works as upstream
+documents.
 
 `t3 status` prints upstream's status, which always says "Service not installed"
 on Intel, followed by the state of this wrapper's service.

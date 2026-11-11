@@ -29,8 +29,33 @@ case "$1" in
   *) echo "node $*" ;;
 esac
 EOF
+  # launchctl keeps loaded agents as files, so service paths run on any OS.
+  stub launchctl <<'EOF'
+state="$HOME/.launchctl"
+mkdir -p "$state"
+case "$1" in
+  print)
+    [ -f "$state/${2##*/}" ] || exit 113
+    printf '\tstate = running\n\tpid = 4242\n'
+    ;;
+  bootstrap)
+    label="$(sed -n 's|.*<key>Label</key><string>\(.*\)</string>.*|\1|p' "$3")"
+    cp "$3" "$state/$label"
+    ;;
+  bootout) rm -f "$state/${2##*/}" ;;
+  kickstart) echo "kickstart ${3##*/}" >>"$state/log" ;;
+  *) echo "unexpected launchctl $*" >&2; exit 2 ;;
+esac
+EOF
+  stub plutil <<'EOF'
+exit 0
+EOF
+  stub uname <<'EOF'
+case "$1" in -m) echo x86_64 ;; *) echo Darwin ;; esac
+EOF
   export PATH="$BATS_TEST_TMPDIR/stubs:$PATH"
   export T3_NODE="$BATS_TEST_TMPDIR/stubs/node"
+  export T3_NONINTERACTIVE=1
 
   make_upstream
   export T3_REPO="$BATS_TEST_TMPDIR/t3code"
@@ -216,19 +241,91 @@ EOF
   [[ "$output" == *"t3 service install"* ]]
 }
 
-@test "t3 up treats upstream's darwin-x64 service failure as expected" {
-  "$T3" update --channel stable --yes
-  export T3CODE_HOME="$HOME/.t3"
-  mkdir -p "$T3CODE_HOME"
+# Stub node acting as upstream `t3 up`: writes service.env, then fails like the
+# darwin-x64 service install does unless STUB_UP_OK is set.
+stub_upstream_up() {
   stub node <<'EOF2'
-echo "T3CODE_LAN=true" >"$T3CODE_HOME/service.env"
+home="$HOME/.t3"
+prev=""
+for a in "$@"; do [ "$prev" = --base-dir ] && home="$a"; prev="$a"; done
+mkdir -p "$home"
+[ -z "${STUB_LAN:-}" ] || echo "T3CODE_LAN=$STUB_LAN" >"$home/service.env"
+[ -n "${STUB_UP_OK:-}" ] && exit 0
 echo "ERROR: Background setup failed while selecting a t3 release archive for darwin-x64."
 exit 1
 EOF2
-  run "$T3" up --lan
+}
+
+plist() { echo "$HOME/Library/LaunchAgents/$T3_SERVICE_LABEL.plist"; }
+kicks() { cat "$HOME/.launchctl/log" 2>/dev/null | grep -c kickstart || true; }
+
+@test "t3 up installs the wrapper's service where upstream would install its own" {
+  "$T3" update --channel stable --yes
+  stub_upstream_up
+  STUB_LAN=true run "$T3" up --lan
   [ "$status" -eq 0 ]
   [[ "$output" == *"ignore the darwin-x64 error above"* ]]
-  [[ "$output" == *"t3 service install"* ]]
+  [[ "$output" == *"service installed"* ]]
+  [ -f "$HOME/.launchctl/$T3_SERVICE_LABEL" ]
+  grep -q "<key>T3_REPO</key><string>$T3_REPO</string>" "$(plist)"
+  grep -q "__service-run" "$(plist)"
+}
+
+@test "t3 up restarts a running service when the settings change" {
+  "$T3" update --channel stable --yes
+  "$T3" service install
+  stub_upstream_up
+  STUB_LAN=false STUB_UP_OK=1 run "$T3" up --no-lan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"service restarted"* ]]
+  [ "$(kicks)" -eq 1 ]
+}
+
+@test "t3 up with no change leaves the service alone" {
+  "$T3" update --channel stable --yes
+  "$T3" service install
+  stub_upstream_up
+  STUB_UP_OK=1 run "$T3" up --no-lan
+  [ "$status" -eq 0 ]
+  [ "$(kicks)" -eq 0 ]
+}
+
+@test "t3 up for another T3 home doesn't touch a service serving ~/.t3" {
+  "$T3" update --channel stable --yes
+  "$T3" service install
+  stub_upstream_up
+  STUB_LAN=true run "$T3" up --lan --base-dir "$BATS_TEST_TMPDIR/other"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"left alone"* ]]
+  [ "$(kicks)" -eq 0 ]
+}
+
+@test "a service installed for a custom T3 home records it" {
+  "$T3" update --channel stable --yes
+  mkdir -p "$BATS_TEST_TMPDIR/home2"
+  T3CODE_HOME="$BATS_TEST_TMPDIR/home2" run "$T3" service install
+  [ "$status" -eq 0 ]
+  grep -q "<key>T3CODE_HOME</key><string>$(cd "$BATS_TEST_TMPDIR/home2" && pwd -P)</string>" "$(plist)"
+}
+
+@test "service uninstall unloads the agent and removes its plist" {
+  "$T3" update --channel stable --yes
+  "$T3" service install
+  run "$T3" service uninstall
+  [ "$status" -eq 0 ]
+  [ ! -f "$(plist)" ]
+  [ ! -f "$HOME/.launchctl/$T3_SERVICE_LABEL" ]
+}
+
+@test "t3 status adds the wrapper's service to upstream's report" {
+  "$T3" update --channel stable --yes
+  "$T3" service install
+  stub node <<'EOF2'
+echo "This machine"
+EOF2
+  run "$T3" status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Intel Mac service (t3 service): running · pid 4242"* ]]
 }
 
 @test "other t3 up failures keep their exit code" {
