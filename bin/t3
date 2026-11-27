@@ -262,8 +262,8 @@ stale_servers() {
 describe() {
   local ch="${1:-$(channel)}" tag=""
   case "$ch" in
-    nightly) tag="$(git_repo tag --points-at HEAD -l 'v*-nightly.*' --sort=-v:refname | head -1)" ;;
-    stable) tag="$(git_repo tag --points-at HEAD -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)" ;;
+    nightly) tag="$(git_repo tag --points-at HEAD -l 'v*-nightly.*' --sort=-v:refname | awk 'NR == 1 { print }')" ;;
+    stable) tag="$(git_repo tag --points-at HEAD -l 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !seen++ { print }')" ;;
   esac
   if [ -n "$tag" ]; then
     echo "$tag"
@@ -353,9 +353,9 @@ cmd_update() {
   built="$(built_commit)"
 
   if [ "$target_sha" = "$built" ] && has_build; then
-    if [ -z "$pin" ] || [ "$explicit_ch" = 1 ]; then git_repo config t3.channel "$ch"; fi
     # Builds made before releases existed get their first snapshot here.
     if [ -z "$(current_release)" ] && [ "$(git_repo rev-parse HEAD)" = "$built" ]; then make_release; fi
+    if [ -z "$pin" ] || [ "$explicit_ch" = 1 ]; then git_repo config t3.channel "$ch"; fi
     say "already on ${pin:-$ch} @ $(describe)"
     return
   fi

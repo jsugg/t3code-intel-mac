@@ -176,6 +176,17 @@ head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*
   [ "$(git -C "$T3_REPO" config t3.channel)" = stable ]
 }
 
+@test "a failed snapshot on the same commit preserves the previous channel" {
+  "$T3" update --channel stable --yes
+  rm -rf "$XDG_DATA_HOME/t3code-intel-mac"
+  mkdir -p "$XDG_DATA_HOME/t3code-intel-mac"
+  # Blocking releases/ with a regular file makes make_release fail.
+  touch "$XDG_DATA_HOME/t3code-intel-mac/releases"
+  run "$T3" update v0.1.1 --channel nightly --yes
+  [ "$status" -ne 0 ]
+  [ "$(git -C "$T3_REPO" config t3.channel)" = stable ]
+}
+
 @test "co-tagged commit reports the tag matching the active channel" {
   git -C "$UPSTREAM" tag v0.1.2 v0.1.2-nightly.20261111.11
   run "$T3" update --channel nightly --yes
