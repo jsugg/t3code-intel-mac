@@ -131,7 +131,7 @@ resolve_node() {
 build() {
   resolve_node
   load_vp
-  say "building $(describe) with Node $("$NODE" --version)"
+  say "building $(describe "${1:-}") with Node $("$NODE" --version)"
   local path
   path="$(dirname "$NODE"):$PATH"
   (cd "$T3_REPO" && PATH="$path" vp i && PATH="$path" vp run build:desktop)
@@ -257,7 +257,20 @@ stale_servers() {
 
 # --- Channels and updates ------------------------------------------------------
 
-describe() { git_repo describe --tags --exclude 'mobile-*' --always; }
+# Prefer a tag matching the active channel when a commit carries both a stable
+# and a nightly tag, so `t3 channel` stays on the channel's own tag name.
+describe() {
+  local ch="${1:-$(channel)}" tag=""
+  case "$ch" in
+    nightly) tag="$(git_repo tag --points-at HEAD -l 'v*-nightly.*' --sort=-v:refname | awk 'NR == 1 { print }')" ;;
+    stable) tag="$(git_repo tag --points-at HEAD -l 'v*' --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !seen++ { print }')" ;;
+  esac
+  if [ -n "$tag" ]; then
+    echo "$tag"
+  else
+    git_repo describe --tags --exclude 'mobile-*' --always
+  fi
+}
 channel() { git_repo config t3.channel || echo stable; }
 
 # Commit of the last successful build. Pre-0.1 installs never recorded it, so a
@@ -274,6 +287,10 @@ has_build() { [ -n "$(current_release)" ] || [ -f "$SERVER_BIN" ]; }
 # main is the untagged tip, newer than either and never released.
 resolve_target() {
   local ch="$1" pin="$2" tag
+  case "$ch" in
+    stable | nightly | main) ;;
+    *) die "unknown channel '$ch' (stable, nightly, main)" ;;
+  esac
   if [ -n "$pin" ]; then
     tag="v${pin#v}"
     git_repo rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "no release tag $tag"
@@ -284,7 +301,6 @@ resolve_target() {
     main) echo origin/main ;;
     stable) tag="$(git_repo tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)" ;;
     nightly) tag="$(git_repo tag -l 'v*-nightly.*' --sort=-v:refname | head -1)" ;;
-    *) die "unknown channel '$ch' (stable, nightly, main)" ;;
   esac
   [ "$ch" = main ] && return
   [ -n "$tag" ] || die "no $ch release tag found"
@@ -315,13 +331,13 @@ restore() {
 }
 
 cmd_update() {
-  local ch pin="" allow_downgrade=0 target target_sha built prev_ref prev_sha
+  local ch pin="" explicit_ch=0 allow_downgrade=0 target target_sha built prev_ref prev_sha
   require_repo
   ch="$(channel)"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --channel) ch="${2:-}"; [ -n "$ch" ] || die "--channel needs a value"; shift ;;
-      --channel=*) ch="${1#--channel=}" ;;
+      --channel) ch="${2:-}"; [ -n "$ch" ] || die "--channel needs a value"; explicit_ch=1; shift ;;
+      --channel=*) ch="${1#--channel=}"; explicit_ch=1 ;;
       --allow-downgrade) allow_downgrade=1 ;;
       --yes | -y) ASSUME_YES=1 ;;
       -*) die "unknown update flag '$1'" ;;
@@ -337,9 +353,9 @@ cmd_update() {
   built="$(built_commit)"
 
   if [ "$target_sha" = "$built" ] && has_build; then
-    [ -n "$pin" ] || git_repo config t3.channel "$ch"
     # Builds made before releases existed get their first snapshot here.
     if [ -z "$(current_release)" ] && [ "$(git_repo rev-parse HEAD)" = "$built" ]; then make_release; fi
+    if [ -z "$pin" ] || [ "$explicit_ch" = 1 ]; then git_repo config t3.channel "$ch"; fi
     say "already on ${pin:-$ch} @ $(describe)"
     return
   fi
@@ -351,7 +367,7 @@ cmd_update() {
   prev_sha="$(git_repo rev-parse HEAD)"
   prev_ref="$(git_repo symbolic-ref -q --short HEAD || echo "$prev_sha")"
   checkout "$target"
-  if ! build; then
+  if ! build "$ch"; then
     say "build failed; restoring $prev_ref"
     restore "$prev_ref" "$prev_sha"
     if [ -n "$(current_release)" ]; then
@@ -363,7 +379,7 @@ cmd_update() {
     die "update aborted; still on $(describe)"
   fi
   make_release
-  [ -n "$pin" ] || git_repo config t3.channel "$ch"
+  if [ -z "$pin" ] || [ "$explicit_ch" = 1 ]; then git_repo config t3.channel "$ch"; fi
   say "now on ${pin:+pinned }${pin:-$ch} @ $(describe)"
   after_build
 }

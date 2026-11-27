@@ -162,11 +162,55 @@ head_tag() { git -C "$T3_REPO" describe --tags --exact-match --exclude 'mobile-*
   [ "$(git -C "$T3_REPO" config t3.channel)" = stable ]
 }
 
+@test "pinning a version with --channel switches the channel" {
+  "$T3" update --channel stable --yes
+  run "$T3" update v0.1.2-nightly.20261111.11 --channel nightly --yes
+  [ "$status" -eq 0 ]
+  [ "$(git -C "$T3_REPO" config t3.channel)" = nightly ]
+  run "$T3" channel
+  [ "$output" = "nightly @ v0.1.2-nightly.20261111.11" ]
+
+  run "$T3" update v0.1.2-nightly.20261111.11 --channel stable --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already on"* ]]
+  [ "$(git -C "$T3_REPO" config t3.channel)" = stable ]
+}
+
+@test "a failed snapshot on the same commit preserves the previous channel" {
+  "$T3" update --channel stable --yes
+  rm -rf "$XDG_DATA_HOME/t3code-intel-mac"
+  mkdir -p "$XDG_DATA_HOME/t3code-intel-mac"
+  # Blocking releases/ with a regular file makes make_release fail.
+  touch "$XDG_DATA_HOME/t3code-intel-mac/releases"
+  run "$T3" update v0.1.1 --channel nightly --yes
+  [ "$status" -ne 0 ]
+  [ "$(git -C "$T3_REPO" config t3.channel)" = stable ]
+}
+
+@test "co-tagged commit reports the tag matching the active channel" {
+  git -C "$UPSTREAM" tag v0.1.2 v0.1.2-nightly.20261111.11
+  run "$T3" update --channel nightly --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"building v0.1.2-nightly.20261111.11"* ]]
+  [[ "$output" == *"now on nightly @ v0.1.2-nightly.20261111.11"* ]]
+  run "$T3" channel
+  [ "$output" = "nightly @ v0.1.2-nightly.20261111.11" ]
+
+  run "$T3" update --channel stable --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already on stable @ v0.1.2"* ]]
+  run "$T3" channel
+  [ "$output" = "stable @ v0.1.2" ]
+}
+
 @test "unknown version and channel fail clearly" {
   run "$T3" update 7.7.7 --yes
   [ "$status" -ne 0 ]
   [[ "$output" == *"no release tag v7.7.7"* ]]
   run "$T3" update --channel beta --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown channel 'beta'"* ]]
+  run "$T3" update 0.1.1 --channel beta --yes
   [ "$status" -ne 0 ]
   [[ "$output" == *"unknown channel 'beta'"* ]]
 }
